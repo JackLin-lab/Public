@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0f172a">
+<meta name="screen-orientation" content="portrait">
+<title>GPS 軌跡記錄</title>
+<style>
+  :root{
+    --bg:#0f172a; --card:#1e293b; --line:#334155;
+    --text:#f1f5f9; --sub:#94a3b8; --accent:#22c55e; --warn:#f59e0b; --red:#ef4444; --blue:#38bdf8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;background:var(--bg);color:var(--text);
+    font-family:-apple-system,"Noto Sans TC","Roboto",sans-serif;overflow:hidden;touch-action:manipulation}
+  #app{height:100dvh;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 10px env(safe-area-inset-bottom) 10px;gap:8px}
+  header{display:flex;align-items:center;justify-content:space-between;padding-top:8px;font-size:13px;color:var(--sub)}
+  #gpsStatus{display:flex;align-items:center;gap:6px}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--warn)}
+  .dot.ok{background:var(--accent)} .dot.bad{background:var(--red)}
+  #hdrBtns{display:flex;gap:6px}
+  #fsBtn,#gpsBtn{background:none;border:1px solid var(--line);color:var(--sub);border-radius:8px;padding:4px 10px;font-size:13px}
+  #mapWrap{position:relative;flex:1;min-height:150px;background:var(--card);border-radius:14px;overflow:hidden}
+  #map{width:100%;height:100%;display:block}
+  #profileWrap{height:64px;background:var(--card);border-radius:12px;position:relative;overflow:hidden}
+  #profile{width:100%;height:100%;display:block}
+  .tag{position:absolute;left:8px;top:4px;font-size:11px;color:var(--sub)}
+  #grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .card{background:var(--card);border-radius:12px;padding:8px 12px}
+  .card .lbl{font-size:12px;color:var(--sub)}
+  .card .val{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.2}
+  .card .val small{font-size:13px;font-weight:400;color:var(--sub);margin-left:3px}
+  .card.big{grid-column:span 2;display:flex;justify-content:space-between;align-items:flex-end}
+  .card.big .val{font-size:36px;color:var(--accent)}
+  #btns{display:flex;gap:10px;padding:2px 0 10px}
+  button.main{flex:1;height:56px;border:none;border-radius:14px;font-size:20px;font-weight:700;color:#fff;background:var(--accent)}
+  button.main.running{background:var(--warn)}
+  button.sec{width:96px;height:56px;border:1px solid var(--line);border-radius:14px;font-size:17px;color:var(--text);background:var(--card)}
+  .up{color:var(--accent)} .down{color:var(--red)}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div id="gpsStatus"><span class="dot" id="dot"></span><span id="gpsTxt">等待 GPS 定位…</span></div>
+    <div id="hdrBtns">
+      <button id="gpsBtn">📍 重新定位</button>
+      <button id="fsBtn">⛶ 全螢幕</button>
+    </div>
+  </header>
+
+  <div id="mapWrap"><canvas id="map"></canvas></div>
+  <div id="profileWrap"><span class="tag">海拔剖面</span><canvas id="profile"></canvas></div>
+
+  <div id="grid">
+    <div class="card big">
+      <div><div class="lbl">移動距離</div><div class="val"><span id="dist">0.00</span><small>km</small></div></div>
+      <div style="text-align:right"><div class="lbl">時間</div><div class="val" style="font-size:26px;color:var(--text)" id="time">00:00:00</div></div>
+    </div>
+    <div class="card"><div class="lbl">目前時速</div><div class="val"><span id="spd">0.0</span><small>km/h</small></div></div>
+    <div class="card"><div class="lbl">平均時速</div><div class="val"><span id="avg">0.0</span><small>km/h</small></div></div>
+    <div class="card"><div class="lbl">目前海拔</div><div class="val"><span id="alt">--</span><small>m</small></div></div>
+    <div class="card"><div class="lbl">與起點高低差</div><div class="val"><span id="dalt">--</span><small>m</small></div></div>
+  </div>
+
+  <div id="btns">
+    <button class="main" id="mainBtn">開始</button>
+    <button class="sec" id="resetBtn">重設</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const $ = id => document.getElementById(id);
+  const R = 6371000;
+  const MAX_ACC = 30;      // 超過此精度(公尺)的點捨棄
+  const MIN_MOVE = 3;      // 小於此位移(公尺)視為漂移
+  let watchId = null, wakeLock = null;
+  let state = 'idle';      // idle | running | paused
+  let pts = [];            // 軌跡點 {lat,lon,alt}
+  let cur = null;          // 目前位置
+  let dist = 0;            // 公尺
+  let startAlt = null, altSm = null;
+  let elapsed = 0, lastTick = 0, timer = null;
+  let curSpeed = 0, lastPt = null, lastTime = 0;
+  let profile = [];        // [距離, 海拔]
+
+  const toRad = d => d*Math.PI/180;
+  function hav(a,b){
+    const dLat = toRad(b.lat-a.lat), dLon = toRad(b.lon-a.lon);
+    const x = Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
+    return 2*R*Math.asin(Math.sqrt(x));
+  }
+  const fmtT = s => {
+    s = Math.floor(s);
+    const h = String(Math.floor(s/3600)).padStart(2,'0');
+    const m = String(Math.floor(s%3600/60)).padStart(2,'0');
+    const ss = String(s%60).padStart(2,'0');
+    return `${h}:${m}:${ss}`;
+  };
+
+  /* ---------- GPS ---------- */
+  function setStatus(cls, txt){ $('dot').className = 'dot ' + cls; $('gpsTxt').textContent = txt; }
+
+  function onPos(p){
+    const c = p.coords;
+    const pt = { lat:c.latitude, lon:c.longitude, alt:c.altitude, acc:c.accuracy, spd:c.speed, t:p.timestamp };
+    cur = pt;
+    setStatus(c.accuracy <= MAX_ACC ? 'ok' : 'warn',
+      `GPS 精度 ±${Math.round(c.accuracy)} m`);
+
+    // 海拔平滑
+    if (c.altitude != null && !isNaN(c.altitude)) {
+      altSm = altSm == null ? c.altitude : altSm*0.7 + c.altitude*0.3;
+      $('alt').textContent = altSm.toFixed(1);
+      if (startAlt != null) updateDAlt();
+    } else if (altSm == null) {
+      $('alt').textContent = '無資料';
+    }
+
+    if (state === 'running') {
+      if (c.accuracy > MAX_ACC) { draw(); return; }
+      if (!lastPt) {
+        addPoint(pt, 0);
+      } else {
+        const d = hav(lastPt, pt);
+        const dt = (pt.t - lastTime)/1000;
+        const minMove = Math.max(MIN_MOVE, c.accuracy*0.4);
+        if (d >= minMove) {
+          // 目前時速：優先用 GPS 速度，否則用位移推算
+          let v = (c.speed != null && !isNaN(c.speed)) ? c.speed : (dt>0 ? d/dt : 0);
+          curSpeed = curSpeed*0.5 + v*0.5;
+          addPoint(pt, d);
+        } else {
+          curSpeed = curSpeed*0.7;   // 幾乎沒動 → 逐漸歸零
+          if (curSpeed < 0.3) curSpeed = 0;
+        }
+      }
+      updateStats();
+    } else if (state === 'idle') {
+      draw();
+    }
+  }
+
+  function addPoint(pt, d){
+    dist += d;
+    pts.push({lat:pt.lat, lon:pt.lon});
+    profile.push([dist, altSm]);
+    lastPt = pt; lastTime = pt.t;
+  }
+
+  let retryTimer = null;
+  function onErr(e){
+    const m = {1:'定位權限被拒絕', 2:'無法取得位置', 3:'定位逾時'}[e.code] || '定位錯誤';
+    setStatus('bad', m + (e.code===1 ? '（請允許權限後按重新定位）' : '，自動重試中…'));
+    // 訊號暫時中斷或逾時：5 秒後自動重新連接 GPS（權限被拒則不重試）
+    if (e.code !== 1){
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(restartGps, 5000);
+    }
+  }
+
+  // 手動／自動重新連接 GPS
+  function restartGps(){
+    clearTimeout(retryTimer);
+    if (watchId != null){ navigator.geolocation.clearWatch(watchId); watchId = null; }
+    setStatus('warn', '重新搜尋 GPS 訊號…');
+    startWatch();
+  }
+
+  function startWatch(){
+    if (!('geolocation' in navigator)) { setStatus('bad','此瀏覽器不支援定位'); return; }
+    if (watchId != null) return;
+    watchId = navigator.geolocation.watchPosition(onPos, onErr,
+      { enableHighAccuracy:true, maximumAge:0, timeout:20000 });
+  }
+
+  /* ---------- 統計 ---------- */
+  function updateDAlt(){
+    if (altSm == null || startAlt == null) return;
+    const d = altSm - startAlt;
+    const el = $('dalt');
+    el.textContent = (d>=0?'+':'') + d.toFixed(1);
+    el.className = d>=0 ? 'up' : 'down';
+  }
+  function updateStats(){
+    $('dist').textContent = (dist/1000).toFixed(2);
+    $('spd').textContent = (curSpeed*3.6).toFixed(1);
+    const avg = elapsed>0 ? dist/elapsed*3.6 : 0;
+    $('avg').textContent = avg.toFixed(1);
+    $('time').textContent = fmtT(elapsed);
+    updateDAlt();
+    draw();
+  }
+
+  function tick(){
+    const now = Date.now();
+    elapsed += (now - lastTick)/1000;
+    lastTick = now;
+    $('time').textContent = fmtT(elapsed);
+    $('avg').textContent = (elapsed>0 ? dist/elapsed*3.6 : 0).toFixed(1);
+  }
+
+  /* ---------- 控制 ---------- */
+  async function lockWake(){
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch(e){}
+  }
+  function goFull(){
+    const el = document.documentElement;
+    if (!document.fullscreenElement && el.requestFullscreen) {
+      el.requestFullscreen().then(()=>{
+        if (screen.orientation && screen.orientation.lock) screen.orientation.lock('portrait').catch(()=>{});
+      }).catch(()=>{});
+    }
+  }
+
+  function mainClick(){
+    goFull();
+    if (state === 'idle') {
+      pts = []; profile = []; dist = 0; elapsed = 0; curSpeed = 0; lastPt = null;
+      startAlt = altSm;
+      if (cur) { pts.push({lat:cur.lat, lon:cur.lon}); profile.push([0, altSm]); lastPt = cur; lastTime = cur.t; }
+      state = 'running';
+    } else if (state === 'running') {
+      state = 'paused';
+      clearInterval(timer); curSpeed = 0;
+      releaseWake();
+    } else {
+      state = 'running';
+      lastPt = cur; lastTime = cur ? cur.t : 0;   // 暫停期間的位移不計入
+    }
+    if (state === 'running') {
+      lastTick = Date.now();
+      clearInterval(timer); timer = setInterval(tick, 1000);
+      lockWake();
+    }
+    refreshBtn(); updateStats();
+  }
+  function releaseWake(){ if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; } }
+
+  function resetAll(){
+    if (state !== 'idle' && !confirm('確定要清除目前記錄並重設？')) return;
+    clearInterval(timer); releaseWake();
+    state = 'idle'; pts = []; profile = []; dist = 0; elapsed = 0; curSpeed = 0; lastPt = null; startAlt = null;
+    $('dalt').textContent = '--'; $('dalt').className = '';
+    refreshBtn(); updateStats();
+  }
+
+  function refreshBtn(){
+    const b = $('mainBtn');
+    b.textContent = state==='idle' ? '開始' : state==='running' ? '暫停' : '繼續';
+    b.className = 'main' + (state==='running' ? ' running' : '');
+  }
+
+  /* ---------- 繪圖 ---------- */
+  function fitCanvas(cv){
+    const dpr = window.devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    if (cv.width !== Math.round(r.width*dpr) || cv.height !== Math.round(r.height*dpr)) {
+      cv.width = Math.round(r.width*dpr); cv.height = Math.round(r.height*dpr);
+    }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    return {ctx, w:r.width, h:r.height};
+  }
+
+  function draw(){ drawMap(); drawProfile(); }
+
+  function drawMap(){
+    const {ctx, w, h} = fitCanvas($('map'));
+    ctx.clearRect(0,0,w,h);
+    const all = pts.length ? pts.slice() : [];
+    if (cur) all.push({lat:cur.lat, lon:cur.lon});
+    // 格線
+    ctx.strokeStyle = '#273449'; ctx.lineWidth = 1;
+    for (let x=0; x<w; x+=40){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+    for (let y=0; y<h; y+=40){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+    if (!all.length){
+      ctx.fillStyle = '#94a3b8'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('等待 GPS 定位…', w/2, h/2); return;
+    }
+    const lat0 = all[0].lat, lon0 = all[0].lon, k = Math.cos(toRad(lat0));
+    const P = p => ({ x:(p.lon-lon0)*k*111320, y:(p.lat-lat0)*110540 });
+    let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+    all.forEach(p=>{ const q=P(p); minX=Math.min(minX,q.x); maxX=Math.max(maxX,q.x); minY=Math.min(minY,q.y); maxY=Math.max(maxY,q.y); });
+    const span = Math.max(maxX-minX, maxY-minY, 60);
+    const pad = 28, sc = (Math.min(w,h)-pad*2)/span;
+    const cx = (minX+maxX)/2, cy = (minY+maxY)/2;
+    const T = p => { const q=P(p); return { x:w/2+(q.x-cx)*sc, y:h/2-(q.y-cy)*sc }; };
+
+    // 軌跡
+    if (pts.length > 1){
+      ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+      ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 4;
+      ctx.beginPath();
+      pts.forEach((p,i)=>{ const t=T(p); i? ctx.lineTo(t.x,t.y) : ctx.moveTo(t.x,t.y); });
+      ctx.stroke();
+    }
+    // 起點
+    const s = T(all[0]);
+    ctx.fillStyle = '#22c55e'; ctx.beginPath(); ctx.arc(s.x,s.y,7,0,7); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('起點', s.x+10, s.y+4);
+    // 目前位置
+    if (cur){
+      const c = T({lat:cur.lat, lon:cur.lon});
+      ctx.fillStyle = 'rgba(239,68,68,.25)'; ctx.beginPath(); ctx.arc(c.x,c.y,13,0,7); ctx.fill();
+      ctx.fillStyle = '#ef4444'; ctx.beginPath(); ctx.arc(c.x,c.y,6,0,7); ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
+    }
+    // 比例尺
+    const nice = [10,20,50,100,200,500,1000,2000,5000,10000];
+    let m = nice[0]; for (const n of nice){ if (n*sc <= w*0.3) m = n; }
+    const bw = m*sc, bx = 12, by = h-14;
+    ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(bx,by-4); ctx.lineTo(bx,by); ctx.lineTo(bx+bw,by); ctx.lineTo(bx+bw,by-4); ctx.stroke();
+    ctx.fillStyle = '#cbd5e1'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(m>=1000 ? (m/1000)+' km' : m+' m', bx+bw+6, by);
+    // 北向
+    ctx.textAlign = 'center'; ctx.fillStyle = '#94a3b8'; ctx.font = 'bold 12px sans-serif';
+    ctx.fillText('N ↑', w-22, 18);
+  }
+
+  function drawProfile(){
+    const {ctx, w, h} = fitCanvas($('profile'));
+    ctx.clearRect(0,0,w,h);
+    const data = profile.filter(p=>p[1]!=null);
+    if (data.length < 2) return;
+    let mn=1e9,mx=-1e9; data.forEach(p=>{ mn=Math.min(mn,p[1]); mx=Math.max(mx,p[1]); });
+    if (mx-mn < 5){ const c=(mx+mn)/2; mn=c-2.5; mx=c+2.5; }
+    const dmax = Math.max(data[data.length-1][0], 1);
+    const X = d => 6 + d/dmax*(w-12), Y = a => h-8 - (a-mn)/(mx-mn)*(h-26);
+    ctx.beginPath(); ctx.moveTo(X(data[0][0]), h-4);
+    data.forEach(p=>ctx.lineTo(X(p[0]),Y(p[1])));
+    ctx.lineTo(X(data[data.length-1][0]), h-4); ctx.closePath();
+    ctx.fillStyle = 'rgba(34,197,94,.22)'; ctx.fill();
+    ctx.beginPath(); data.forEach((p,i)=>{ i? ctx.lineTo(X(p[0]),Y(p[1])) : ctx.moveTo(X(p[0]),Y(p[1])); });
+    ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#94a3b8'; ctx.font = '10px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(mx)+' m', w-6, 12);
+    ctx.fillText(Math.round(mn)+' m', w-6, h-10);
+  }
+
+  /* ---------- 事件 ---------- */
+  $('mainBtn').addEventListener('click', mainClick);
+  $('resetBtn').addEventListener('click', resetAll);
+  $('fsBtn').addEventListener('click', goFull);
+  $('gpsBtn').addEventListener('click', restartGps);
+  window.addEventListener('resize', draw);
+  document.addEventListener('visibilitychange', ()=>{
+    if (document.visibilityState === 'visible' && state === 'running') lockWake();
+  });
+
+  // 開啟後立即抓取目前位置與海拔
+  startWatch();
+  draw();
+})();
+</script>
+</body>
+</html>
