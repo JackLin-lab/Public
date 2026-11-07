@@ -7,6 +7,20 @@
 <meta name="theme-color" content="#0f172a">
 <meta name="screen-orientation" content="portrait">
 <title>GPS 軌跡記錄</title>
+<script>
+// 任何 JS 錯誤都顯示在左上角狀態列，方便除錯
+(function(){
+  function show(msg){
+    var t = document.getElementById('gpsTxt'), d = document.getElementById('dot');
+    if (t) t.textContent = '錯誤：' + msg;
+    if (d) d.className = 'dot bad';
+  }
+  window.addEventListener('error', function(e){ show(e.message || e); });
+  window.addEventListener('unhandledrejection', function(e){
+    show((e.reason && e.reason.message) || e.reason || 'promise');
+  });
+})();
+</script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
 <style>
@@ -98,8 +112,15 @@
   const MIN_MOVE = 3;      // 小於此位移(公尺)視為漂移
   // 是否在 Capacitor 原生 App 內執行（是 → 用背景定位外掛；否 → 用瀏覽器定位）
   const CapObj = window.Capacitor;
-  const isNative = !!(CapObj && CapObj.isNativePlatform && CapObj.isNativePlatform());
-  const BG = isNative ? CapObj.registerPlugin('BackgroundGeolocation') : null;
+  const isNative = !!(CapObj && typeof CapObj.isNativePlatform === 'function' && CapObj.isNativePlatform());
+  // 取得原生外掛：先用 Capacitor.Plugins（純 HTML 頁面可用），再試 registerPlugin；失敗回傳 null
+  function getPlugin(name){
+    try { if (CapObj.Plugins && CapObj.Plugins[name]) return CapObj.Plugins[name]; } catch(e){}
+    try { if (typeof CapObj.registerPlugin === 'function') return CapObj.registerPlugin(name); } catch(e){}
+    return null;
+  }
+  const BG = isNative ? getPlugin('BackgroundGeolocation') : null;
+  const useBG = !!BG;   // 有取得背景定位外掛才走原生路徑，否則退回瀏覽器定位
   let nativeWatcher = null, lastNativeErr = null, bgMode = false;
   let keepAwake = !isNative;   // 螢幕常亮：網頁版預設開，App 版預設關（可按 ☀ 切換）
   let watchId = null, wakeLock = null;
@@ -220,7 +241,7 @@
   // 手動／自動重新連接 GPS
   function restartGps(){
     clearTimeout(retryTimer);
-    if (isNative){
+    if (useBG){
       if (lastNativeErr === 'NOT_AUTHORIZED'){
         lastNativeErr = null;
         try { BG.openSettings(); } catch(e){}
@@ -236,7 +257,7 @@
   }
 
   function startWatch(){
-    if (isNative){ startNativeWatch(false); return; }
+    if (useBG){ startNativeWatch(false); return; }
     if (!('geolocation' in navigator)) { setStatus('bad','此瀏覽器不支援定位'); return; }
     if (watchId != null) return;
     watchId = navigator.geolocation.watchPosition(onPos, onErr,
@@ -313,7 +334,7 @@
       state = 'paused';
       clearInterval(timer); curSpeed = 0;
       releaseWake();
-      if (isNative) startNativeWatch(false);      // 暫停 → 關閉背景服務省電
+      if (useBG) startNativeWatch(false);         // 暫停 → 關閉背景服務省電
     } else {
       state = 'running';
       lastPt = cur; lastTime = cur ? cur.t : 0;   // 暫停期間的位移不計入
@@ -322,7 +343,7 @@
       lastTick = Date.now(); speedStartT = lastTick; recentMoves = [];
       clearInterval(timer); timer = setInterval(tick, 1000);
       applyWake();
-      if (isNative) startNativeWatch(true);       // 開始／繼續 → 啟動背景服務
+      if (useBG) startNativeWatch(true);          // 開始／繼續 → 啟動背景服務
     }
     refreshBtn(); updateStats();
   }
@@ -331,7 +352,7 @@
   function resetAll(){
     if (state !== 'idle' && !confirm('確定要清除目前記錄並重設？')) return;
     clearInterval(timer); releaseWake();
-    if (isNative && bgMode) startNativeWatch(false);
+    if (useBG && bgMode) startNativeWatch(false);
     state = 'idle'; pts = []; profile = []; dist = 0; elapsed = 0; curSpeed = 0; lastPt = null; startAlt = null;
     $('dalt').textContent = '--'; $('dalt').className = '';
     refreshBtn(); updateStats();
@@ -516,8 +537,11 @@
   setMapMode(!!lmap);   // 有網路 → 預設街道圖；否則純軌跡
   (async () => {
     // App 版：先要通知權限（前景服務的通知），再啟動定位，避免兩個授權視窗互相打架
-    if (isNative){
-      try { await CapObj.registerPlugin('LocalNotifications').requestPermissions(); } catch(e){}
+    if (useBG){
+      try {
+        const LN = getPlugin('LocalNotifications');
+        if (LN) await LN.requestPermissions();
+      } catch(e){}
     }
     startWatch();
   })();
