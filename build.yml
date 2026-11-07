@@ -1,0 +1,108 @@
+name: Build Android APK
+
+# 手動執行：Actions 頁面 → Build Android APK → Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create Capacitor project
+        run: |
+          set -e
+          test -f app.html || { echo "找不到 app.html，請先把它上傳到儲存庫根目錄"; exit 1; }
+          mkdir -p cap-build/www
+          cp app.html cap-build/www/index.html
+          cd cap-build
+
+          cat > package.json <<'EOF'
+          {
+            "name": "gps-track",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^6.0.0",
+              "@capacitor/core": "^6.0.0",
+              "@capacitor/local-notifications": "^6.0.0",
+              "@capacitor-community/background-geolocation": "^1.2.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^6.0.0"
+            }
+          }
+          EOF
+
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.jacklin.gpstrack",
+            "appName": "GPS軌跡",
+            "webDir": "www",
+            "backgroundColor": "#0f172a",
+            "android": {
+              "useLegacyBridge": true
+            }
+          }
+          EOF
+
+      - name: Install dependencies
+        working-directory: cap-build
+        run: npm install --no-audit --no-fund --legacy-peer-deps
+
+      - name: Add Android platform
+        working-directory: cap-build
+        run: npx cap add android
+
+      - name: Patch AndroidManifest
+        working-directory: cap-build
+        run: |
+          set -e
+          python3 - <<'EOF'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p, encoding='utf-8').read()
+          perms = [
+            'ACCESS_FINE_LOCATION',
+            'ACCESS_COARSE_LOCATION',
+            'ACCESS_BACKGROUND_LOCATION',
+            'FOREGROUND_SERVICE',
+            'FOREGROUND_SERVICE_LOCATION',
+            'POST_NOTIFICATIONS',
+            'WAKE_LOCK',
+          ]
+          add = ''.join('    <uses-permission android:name="android.permission.%s" />\n' % x
+                        for x in perms if ('android.permission.%s"' % x) not in s)
+          assert '</manifest>' in s
+          s = s.replace('</manifest>', add + '</manifest>', 1)
+          if 'screenOrientation' not in s:
+              s = s.replace('<activity', '<activity android:screenOrientation="portrait"', 1)
+          open(p, 'w', encoding='utf-8').write(s)
+          print(s)
+          EOF
+
+      - name: Sync Capacitor
+        working-directory: cap-build
+        run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: cap-build/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gps-track-apk
+          path: cap-build/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
